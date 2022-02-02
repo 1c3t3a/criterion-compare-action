@@ -1,9 +1,14 @@
 const { inspect } = require("util");
+const path = require("path");
 const exec = require("@actions/exec");
 const core = require("@actions/core");
+const artifact = require('@actions/artifact');
+const rimraf = require('rimraf');
+const fs = require("fs");
 const github = require("@actions/github");
 
 const context = github.context;
+const WORKDIR = path.join(process.cwd(), '_comment-store');
 
 async function main() {
   const inputs = {
@@ -74,17 +79,43 @@ async function main() {
 
   const contextObj = { ...context.issue };
 
+  // Check if a previous comment for this issue / pr number was already made
+  variableToSearch = {
+    key: contextObj.number,
+    value: undefined,
+  };
+  const commentId = await retrieveArtifact(variableToSearch);
+
   try {
-    const { data: comment } = await octokit.rest.issues.createComment({
-      owner: contextObj.owner,
-      repo: contextObj.repo,
-      issue_number: contextObj.number,
-      body: resultsAsMarkdown,
-    });
-    core.info(
-      `Created comment id '${comment.id}' on issue '${contextObj.number}'.`
-    );
-    core.setOutput("comment-id", comment.id);
+    // If a comment is already present, update it else create a comment
+    if (commentId) {
+      await octokit.rest.issues.updateComment({
+        owner: contextObj.owner,
+        repo: contextObj.repo,
+        comment_id: commentId,
+        body: resultsAsMarkdown,
+      });
+      core.info(
+        `Updated comment id '${commentId}' on issue '${contextObj.number}'.`
+      );
+    } else {
+      const { data: comment } = await octokit.rest.issues.createComment({
+        owner: contextObj.owner,
+        repo: contextObj.repo,
+        issue_number: contextObj.number,
+        body: resultsAsMarkdown,
+      });
+      core.info(
+        `Created comment id '${comment.id}' on issue '${contextObj.number}'.`
+      );
+      variableToSave = {
+        key: contextObj.number,
+        value: comment.id,
+      };
+      core.setOutput("comment-id", comment.id);
+      await storeArtifact(variableToSave);
+    }
+
   } catch (err) {
     core.warning(`Failed to comment: ${err}`);
 
@@ -278,6 +309,50 @@ function convertToTableObject(results) {
 
   return benchResults;
 }
+
+async function storeArtifact(variable) {
+  const client = artifact.create();
+
+  rimraf.sync(WORKDIR);
+  fs.mkdirSync(WORKDIR);
+
+  const file = join(WORKDIR, `${variable.key}.txt`);
+
+  fs.writeFileSync(file, variable.value, { encoding: 'utf8' });
+  try {
+    await client.uploadArtifact(variable.key, [file], process.cwd());
+  } catch (error) {
+    const message = `Error while uploading artifact: ${error?.message}`;
+    if (failIfNotFound) {
+      core.setFailed(message);
+    } else {
+      core.warning(message);
+    }
+  }
+};
+
+async function retrieveArtifact(variable) {
+  const client = artifact.create();
+
+  rimraf.sync(WORKDIR);
+  fs.mkdirSync(WORKDIR);
+
+  try {
+    const file = join(WORKDIR, `${variable.key}.txt`);
+    await client.downloadArtifact(variable.key);
+
+    return fs.readFileSync(file, { encoding: 'utf8' }).toString();
+  } catch (error) {
+    const message = `Cannot retrieve variable ${variable.key}`;
+    if (failIfNotFound) {
+      core.setFailed(message);
+    } else {
+      core.warning(message);
+    }
+  }
+
+  return undefined;
+};
 
 // IIFE to be able to use async/await
 (async () => {
